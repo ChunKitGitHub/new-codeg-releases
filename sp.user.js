@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         虾皮跑任务
 // @namespace    https://viayoo.com/
-// @version      2.0.9
+// @version      2.1.0
 // @description  虾皮任务：领取→抓 get_rw→上传，含时段配额
 // @author       You
 // @run-at       document-start
@@ -50,7 +50,7 @@
 (function () {
   'use strict';
 
-  const 版本 = '2.0.9';
+  const 版本 = '2.1.0';
 
   // ────────────────────────────────────────────── 常量
   const 接口基址 = 'https://allplat.top/api';
