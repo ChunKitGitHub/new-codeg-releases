@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         虾皮跑任务
 // @namespace    https://viayoo.com/
-// @version      2.1.1
+// @version      2.1.2
 // @description  虾皮任务：领取→抓 get_rw→上传，含时段配额
 // @author       You
 // @run-at       document-start
@@ -50,7 +50,7 @@
 (function () {
   'use strict';
 
-  const 版本 = '2.1.1';
+  const 版本 = '2.1.2';
 
   // ────────────────────────────────────────────── 常量
   const 接口基址 = 'https://allplat.top/api';
@@ -62,7 +62,7 @@
   const 更新检查地址 =
     'https://raw.githubusercontent.com/ChunKitGitHub/new-codeg-releases/main/sp.meta.js';
   const 更新安装地址 =
-    'https://raw.githubusercontent.com/ChunKitGitHub/new-codeg-releases/main/sp.user.js';
+    'https://alist.allplat.top/s/SCvxw21T';
   const 更新检查间隔毫秒 = 12 * 60 * 60 * 1000;
   const 更新请求超时毫秒 = 15000;
 
