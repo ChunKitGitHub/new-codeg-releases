@@ -1,15 +1,16 @@
 // ==UserScript==
 // @name         虾皮跑任务
 // @namespace    https://viayoo.com/
-// @version      2.0.7
+// @version      2.0.8
 // @description  虾皮任务：领取→抓 get_rw→上传，含时段配额
 // @author       You
 // @run-at       document-start
 // @match        https://shopee.tw/*
 // @match        https://*.shopee.tw/*
 // @grant        GM_xmlhttpRequest
-// @downloadURL  https://raw.githubusercontent.com/ChunKitGitHub/new-codeg-releases/main/sp.user.js
-// @updateURL    https://raw.githubusercontent.com/ChunKitGitHub/new-codeg-releases/main/sp.user.js
+// @connect      raw.githubusercontent.com
+// @downloadURL  https://cdn.jsdelivr.net/gh/ChunKitGitHub/new-codeg-releases@main/sp.user.js
+// @updateURL    https://cdn.jsdelivr.net/gh/ChunKitGitHub/new-codeg-releases@main/sp.user.js
 // ==/UserScript==
 
 // ============================================================================
@@ -49,11 +50,21 @@
 (function () {
   'use strict';
 
-  const 版本 = '2.0.5';
+  const 版本 = '2.0.8';
 
   // ────────────────────────────────────────────── 常量
   const 接口基址 = 'https://allplat.top/api';
   const 平台 = 'shopee';
+  // GitHub Raw 用于检查（版本立刻可见）；jsDelivr 用于安装（响应是
+  // application/javascript，Via 才会弹出覆盖安装确认，而不是只下载文本）。
+  // 安装时固定到 v<版本号> Git tag，避免 main 分支 CDN 缓存装到旧版本。
+  // 两者都只承载公开脚本，更新请求绝不携带 allplat token、账号或任务数据。
+  const 更新检查地址 =
+    'https://raw.githubusercontent.com/ChunKitGitHub/new-codeg-releases/main/sp.user.js';
+  const 更新安装地址 =
+    'https://cdn.jsdelivr.net/gh/ChunKitGitHub/new-codeg-releases@main/sp.user.js';
+  const 更新检查间隔毫秒 = 12 * 60 * 60 * 1000;
+  const 更新请求超时毫秒 = 15000;
 
   // AES-256-CBC，key/iv 与服务端硬编码一致（接口文档 §2）
   const 密钥文本 = '6y&omes3mXeJt3MYIVZN4T-q52Dio$p*';   // 32 字节
@@ -75,6 +86,7 @@
     回传: '__跑任务_回传__',        // 子页面写、主控页读
     状态: '__跑任务_子页状态__',    // 子页面写、主控页读（在验证码页 / 正常）
     在跑任务: '__跑任务_当前任务__', // 崩溃恢复用：记着哪条任务没结清
+    更新: '__跑任务_更新__',
   };
 
   // ────────────────────────────────────────────── 小工具
@@ -93,6 +105,168 @@
   }
   function 删(键名) {
     try { localStorage.removeItem(键名); } catch (_) {}
+  }
+
+  // ══════════════════════════════════════ GitHub 脚本更新
+  // 用户脚本没有权限静默改写自身；这里仅检查版本，并跳到 Via 的原生覆盖安装页。
+  function 是规范版本(值) {
+    return /^\d+\.\d+\.\d+$/.test(String(值 || '').trim());
+  }
+
+  function 比较版本(甲, 乙) {
+    if (!是规范版本(甲) || !是规范版本(乙)) return null;
+    const a = String(甲).split('.').map(Number);
+    const b = String(乙).split('.').map(Number);
+    for (let i = 0; i < 3; i++) {
+      if (a[i] > b[i]) return 1;
+      if (a[i] < b[i]) return -1;
+    }
+    return 0;
+  }
+
+  function 取更新状态() {
+    const 原 = 读(键.更新, {});
+    const 上次检查 = Number(原 && 原.上次检查);
+    const 候选版本 = String(原 && 原.待更新 && 原.待更新.版本 || '').trim();
+    const 待更新 = 是规范版本(候选版本) && 比较版本(候选版本, 版本) === 1
+      ? {
+          版本: 候选版本,
+          安装链接: String(原.待更新.安装链接 || 更新安装地址),
+        }
+      : null;
+    return {
+      上次检查: Number.isFinite(上次检查) && 上次检查 > 0 ? 上次检查 : 0,
+      状态: String(原 && 原.状态 || '尚未检查').slice(0, 160),
+      待更新,
+      检查中: 更新检查中,
+    };
+  }
+
+  function 存更新状态(状态) {
+    const 可存 = Object.assign({}, 状态);
+    delete 可存.检查中;
+    写(键.更新, 可存);
+    刷新界面();
+  }
+
+  function 带更新参数(地址, 名称, 值) {
+    try {
+      const u = new URL(地址, location.href);
+      u.searchParams.set(名称, String(值));
+      return u.href;
+    } catch (_) {
+      const 分隔 = String(地址).includes('?') ? '&' : '?';
+      return `${地址}${分隔}${encodeURIComponent(名称)}=${encodeURIComponent(String(值))}`;
+    }
+  }
+
+  function 版本安装地址(目标版本) {
+    if (!是规范版本(目标版本)) return 更新安装地址;
+    return `https://cdn.jsdelivr.net/gh/ChunKitGitHub/new-codeg-releases@v${目标版本}/sp.user.js`;
+  }
+
+  function 取远程脚本版本(文本) {
+    const 头 = String(文本 || '').slice(0, 12000);
+    const m = 头.match(/^\/\/\s*@version\s+([0-9]+\.[0-9]+\.[0-9]+)\s*$/m);
+    return m ? m[1] : '';
+  }
+
+  let 更新检查中 = false;
+
+  async function 取远程更新脚本() {
+    const 地址 = 带更新参数(更新检查地址, 'check', 现在());
+    const 头 = { Accept: 'text/plain, application/javascript;q=0.9, */*;q=0.1' };
+    if (有GM) {
+      const r = await GM请求('GET', 地址, 头, undefined, 更新请求超时毫秒);
+      if (!r.成功 || r.状态 < 200 || r.状态 >= 300) {
+        throw new Error(r.错误 || `GitHub 返回 HTTP ${r.状态 || 0}`);
+      }
+      return r.文本;
+    }
+
+    const 控制 = new AbortController();
+    const 定时器 = setTimeout(() => 控制.abort(), 更新请求超时毫秒);
+    try {
+      const r = await fetch(地址, {
+        method: 'GET', cache: 'no-store', credentials: 'omit', headers: 头, signal: 控制.signal,
+      });
+      if (!r.ok) throw new Error(`GitHub 返回 HTTP ${r.status}`);
+      return await r.text();
+    } finally {
+      clearTimeout(定时器);
+    }
+  }
+
+  async function 检查更新(手动 = false) {
+    if (是运行中()) {
+      const 状态 = 取更新状态();
+      状态.状态 = '任务运行中，停止后再检查更新';
+      存更新状态(状态);
+      return { 跳过: '任务运行中' };
+    }
+    if (更新检查中) return { 跳过: '正在检查' };
+
+    const 状态 = 取更新状态();
+    if (!手动 && 现在() - 状态.上次检查 < 更新检查间隔毫秒) {
+      return { 跳过: '未到检查时间' };
+    }
+
+    更新检查中 = true;
+    状态.上次检查 = 现在();
+    状态.状态 = '正在检查 GitHub 更新…';
+    存更新状态(状态);
+    try {
+      const 远程版本 = 取远程脚本版本(await 取远程更新脚本());
+      if (!是规范版本(远程版本)) throw new Error('远程脚本缺少有效版本号');
+      const 比较 = 比较版本(远程版本, 版本);
+      if (比较 === null) throw new Error('版本号格式无效');
+      if (比较 === 1) {
+        状态.待更新 = {
+          版本: 远程版本,
+          安装链接: 版本安装地址(远程版本),
+        };
+        状态.状态 = `发现新版本 ${远程版本}`;
+        return { 成功: true, 有更新: true, 版本: 远程版本 };
+      }
+      状态.待更新 = null;
+      状态.状态 = `已是最新版本 ${版本}`;
+      return { 成功: true, 有更新: false, 版本: 远程版本 };
+    } catch (e) {
+      状态.状态 = `检查失败：${String(e && e.message || e).slice(0, 100)}`;
+      return { 成功: false, 错误: 状态.状态 };
+    } finally {
+      更新检查中 = false;
+      存更新状态(状态);
+    }
+  }
+
+  async function 立即更新() {
+    if (是运行中()) {
+      const 状态 = 取更新状态();
+      状态.状态 = '请先停止任务再更新';
+      存更新状态(状态);
+      return false;
+    }
+    let 状态 = 取更新状态();
+    if (!状态.待更新) {
+      await 检查更新(true);
+      状态 = 取更新状态();
+    }
+    if (!状态.待更新) return false;
+
+    const 地址 = 带更新参数(状态.待更新.安装链接 || 更新安装地址,
+      'version', 状态.待更新.版本);
+    状态.状态 = `正在打开 ${状态.待更新.版本} 的覆盖安装页…`;
+    存更新状态(状态);
+    try {
+      // 当前标签跳转不受移动端异步弹窗策略影响；最终覆盖仍由 Via 明确确认。
+      location.href = 地址;
+      return true;
+    } catch (e) {
+      状态.状态 = `无法打开安装页：${String(e && e.message || e).slice(0, 100)}`;
+      存更新状态(状态);
+      return false;
+    }
   }
 
   // 北京时间的 y-m-d，用于按天统计（服务端也按北京时间算）
@@ -147,12 +321,10 @@
     通知链接: '',        // 例如 https://api.day.app/xxxxx/
     接口模板: 默认接口模板,
     时段: [
-      { 起: '09:00', 止: '12:00', 单数: 20 },
-      { 起: '14:00', 止: '18:00', 单数: 30 },
-      { 起: '19:00', 止: '23:00', 单数: 30 },
+      { 起: '00:01', 止: '23:54', 单数: 1000 },
     ],
-    抖动百分比: 25,      // 间隔上下浮动 ±25%，避免固定节奏
-    最小间隔秒: 20,      // 再怎么赶也不快于这个
+    抖动百分比: 65,      // 间隔上下浮动 ±65%，避免固定节奏
+    最小间隔秒: 45,      // 再怎么赶也不快于这个
     抓取超时秒: 60,      // 等 get_rw 响应的上限
 
     // ── 抓取路线（按风控暴露面从小到大）
@@ -160,9 +332,9 @@
     //   Referer/前端自有头/风控签名全真实，不冷加载。**默认走这条。**
     软导航优先: true,
     // 严格模式：软导航失败就直接放回任务，不再降级。开着最安全。
-    仅软导航: false,
+    仅软导航: true,
     // B 后台标签页：Referer 真实但是冷加载，会触发「系统不稳定」。
-    允许后台页: true,
+    允许后台页: false,
     // A 直连 fetch get_rw：不冷加载，但 Referer 是首页、缺前端自有头，
     //   实测会被风控拦（error=90309999 + 跳 /verify/traffic/error）。
     //   **默认关闭**，除非你确认自己的环境不拦。
@@ -2121,6 +2293,7 @@
       面板.classList.add('开');
       刷新界面();
       刷新服务端完成();
+      检查更新(false);
     });
     收.addEventListener('click', () => 面板.classList.remove('开'));
 
@@ -2128,6 +2301,7 @@
     建配置卡(体);
     建时段卡(体);
     建统计卡(体);
+    建更新卡(体);
     建日志卡(体);
     刷新界面();
   }
@@ -2500,9 +2674,32 @@
     });
   }
 
+  function 建更新卡(体) {
+    const 卡 = 造('div', { 类: '卡' }, 体);
+    造('div', { 类: '卡题', 文: '⑥ 脚本更新' }, 卡);
+    元素.更新当前 = 造('div', { 类: '态', 文: `当前版本：${版本}` }, 卡);
+    元素.更新状态 = 造('div', { 类: '态', 文: '尚未检查' }, 卡);
+    const 行 = 造('div', { 类: '行' }, 卡);
+    元素.检查更新钮 = 造('button', { 类: '钮 灰', 文: '检查更新' }, 行);
+    元素.立即更新钮 = 造('button', { 类: '钮', 文: '立即更新' }, 行);
+    造('div', {
+      类: '提',
+      文: '检查 GitHub 上的公开版本。更新会打开 Via 的覆盖安装确认页；运行任务时不会检查或更新。',
+    }, 卡);
+
+    元素.检查更新钮.addEventListener('click', async () => {
+      await 检查更新(true);
+      刷新界面();
+    });
+    元素.立即更新钮.addEventListener('click', async () => {
+      await 立即更新();
+      刷新界面();
+    });
+  }
+
   function 建日志卡(体) {
     const 卡 = 造('div', { 类: '卡' }, 体);
-    造('div', { 类: '卡题', 文: '⑥ 日志' }, 卡);
+    造('div', { 类: '卡题', 文: '⑦ 日志' }, 卡);
     元素.日志框 = 造('div', { 类: '志' }, 卡);
     const 清 = 造('button', { 类: '钮 灰', 文: '清空日志' }, 卡);
     清.addEventListener('click', () => { 写(键.日志, []); 刷新界面(); });
@@ -2555,6 +2752,20 @@
         : 服务端完成 === null
           ? (服务端完成状态.错误 || '打开面板后从服务器读取完成数')
           : `服务端今日完成：${服务端完成}`;
+    }
+
+    const 更新 = 取更新状态();
+    if (元素.更新当前) 元素.更新当前.textContent = `当前版本：${版本}`;
+    if (元素.更新状态) {
+      元素.更新状态.textContent = 更新.待更新
+        ? `发现新版本：${更新.待更新.版本}`
+        : 更新.状态;
+    }
+    if (元素.检查更新钮) {
+      元素.检查更新钮.disabled = 跑着 || 更新.检查中;
+    }
+    if (元素.立即更新钮) {
+      元素.立即更新钮.disabled = 跑着 || 更新.检查中 || !更新.待更新;
     }
 
     刷新倒计时();
@@ -2631,6 +2842,8 @@
       if (宿主) return;
       if (!document.body) { setTimeout(启动, 40); return; }
       建界面();
+      // 每 12 小时最多检查一次；失败只更新面板状态，不影响任务流程。
+      if (!是运行中()) 检查更新(false);
       // 有 GM 就直接标记通道可用，界面上不必再让用户点「连接桥」
       if (有GM) {
         桥.就绪 = true;
@@ -2726,12 +2939,14 @@
       },
       算间隔, 时段概览, 当前时段,
       通知,
+      比较版本, 取更新状态, 检查更新, 立即更新,
       开始() { 设运行(true); 主循环(); return '已开始'; },
       停止() { 停止请求 = true; 设运行(false); return '已停止'; },
       显示() {
         if (面板) 面板.classList.add('开');
         刷新界面();
         刷新服务端完成();
+        检查更新(false);
       },
       隐藏() { if (面板) 面板.classList.remove('开'); },
       // 排查用：把内部工具也暴露出来
