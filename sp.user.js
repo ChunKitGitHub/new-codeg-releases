@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         虾皮跑任务
 // @namespace    https://viayoo.com/
-// @version      2.1.3
+// @version      2.1.5
 // @description  虾皮任务：领取→抓 get_rw→上传，含时段配额
 // @author       You
 // @run-at       document-start
@@ -50,7 +50,7 @@
 (function () {
   'use strict';
 
-  const 版本 = '2.1.3';
+  const 版本 = '2.1.5';
 
   // ────────────────────────────────────────────── 常量
   const 接口基址 = 'https://allplat.top/api';
@@ -74,6 +74,10 @@
   const 默认接口模板 =
     'https://shopee.tw/api/v4/pdp/get_rw?display_model_id=0&item_id={item}' +
     '&model_selection_logic=3&shop_id={shop}&tz_offset_in_minutes=480&detail_level=0';
+  // error=266900002 是当前账号访问商品时偶发的空数据，不代表商品已不存在。
+  // 最多再等 10 秒给页面后续请求恢复；仍无数据就 failTask 放回 status=0。
+  const 账号暂态错误码 = 266900002;
+  const 账号暂态等待毫秒 = 10 * 1000;
 
   // ────────────────────────────────────────────── 存储键
   const 键 = {
@@ -1416,9 +1420,9 @@
     return `${shop}.${item}`;
   }
 
-  // get_rw 会偶发先回 error=266900002 / data:null，稍后同一请求才有真实详情。
+  // get_rw 的 error=266900002 / data:null 是当前账号访问异常，不是商品不存在。
   // 这里是所有抓取路线共用的唯一放行口：只有请求、业务码和响应商品三者都
-  // 与当前任务一致时才允许提交。无效响应由监听器忽略，继续等下一次响应。
+  // 与当前任务一致时才允许提交。该暂态错误会被上层额外等待 10 秒后放回任务。
   function 校验GetRw响应(文本, 地址, 目标号) {
     const 请求商品 = 取GetRw商品号(地址);
     if (!请求商品) return { 成功: false, 原因: 'get_rw 请求缺少 shop_id 或 item_id' };
@@ -1434,7 +1438,14 @@
 
     const 错误码 = 对象 && 对象.error;
     if (错误码 !== null && 错误码 !== 0) {
-      return { 成功: false, 错误码, 原因: `get_rw 业务错误 error=${错误码}` };
+      const 暂态无数据 = Number(错误码) === 账号暂态错误码 &&
+        (对象.data === null || typeof 对象.data === 'undefined');
+      return {
+        成功: false, 错误码, 暂态无数据,
+        原因: 暂态无数据
+          ? `get_rw error=${账号暂态错误码}（当前账号暂无商品数据）`
+          : `get_rw 业务错误 error=${错误码}`,
+      };
     }
     const 商品 = 对象 && 对象.data && 对象.data.item;
     if (!商品 || typeof 商品 !== 'object') {
@@ -1469,6 +1480,10 @@
       });
       const 文本 = await 响应.text();
       const 校验 = 校验GetRw响应(文本, 地址, 目标号);
+      if (!校验.成功 && 校验.暂态无数据) {
+        // 直连没有页面后续请求可监听；不改为高频重试，只等 10 秒后放回给其它账号。
+        await 等(账号暂态等待毫秒);
+      }
       if (!校验.成功 && 文本 && 校验.原因 === 'get_rw 响应不是 JSON') {
         校验.片段 = 文本.slice(0, 120);
       }
@@ -1585,6 +1600,12 @@
     }
     if (回传.风控) return { 成功: false, 风控: true, 原因: 回传.原因 || '风控' };
     if (回传.验证码) return { 成功: false, 验证码: true, 原因: 回传.原因 || '验证码' };
+    if (回传.暂态无数据) {
+      return {
+        成功: false, 暂态无数据: true, 错误码: 账号暂态错误码,
+        原因: 回传.原因 || `get_rw error=${账号暂态错误码} 等待 10 秒后仍无数据`,
+      };
+    }
     if (!回传.成功) return { 成功: false, 原因: 回传.原因 || '子页面抓取失败' };
     // 正常子页面已校验过一次；这里再校验，避免存储被旧页面或其它脚本写入
     // 时把错误商品/错误响应送进提交接口。
@@ -1644,7 +1665,12 @@
       return { 成功: false, 验证码: true, 原因: '商品页跳到了验证码页' };
     }
     if (!结果 || !结果.成功) {
-      return { 成功: false, 原因: (结果 && 结果.原因) || '等 get_rw 超时' };
+      return {
+        成功: false,
+        暂态无数据: !!(结果 && 结果.暂态无数据),
+        错误码: 结果 && 结果.错误码,
+        原因: (结果 && 结果.原因) || '等 get_rw 超时',
+      };
     }
     return { 成功: true, 数据: 结果.数据, 地址: 结果.地址, 错误码: 结果.错误码 };
   }
@@ -1679,6 +1705,7 @@
     const 原XHR发送 = XMLHttpRequest.prototype.send;
     const 私有 = '__跑任务_本页xhr__';
     let 命中 = null;
+    let 暂态错误时刻 = 0;
     let 已停 = false;
 
     const 是目标 = (网址) => {
@@ -1689,7 +1716,11 @@
     const 收 = (文本, 地址) => {
       if (已停 || 命中 || !文本) return;
       const 校验 = 校验GetRw响应(文本, 地址, 目标号);
-      if (校验.成功) 命中 = 校验;
+      if (校验.成功) {
+        命中 = 校验;
+      } else if (校验.暂态无数据 && !暂态错误时刻) {
+        暂态错误时刻 = 现在();
+      }
     };
 
     if (原fetch) {
@@ -1740,6 +1771,12 @@
         const 截止 = 现在() + 超时毫秒;
         while (现在() < 截止) {
           if (命中) return 命中;
+          if (暂态错误时刻 && 现在() >= 暂态错误时刻 + 账号暂态等待毫秒) {
+            return {
+              成功: false, 暂态无数据: true, 错误码: 账号暂态错误码,
+              原因: `get_rw error=${账号暂态错误码} 等待 10 秒后仍无数据`,
+            };
+          }
           const 类型 = 取验证类型 && 取验证类型();
           if (类型) return {
             成功: false,
@@ -1748,7 +1785,14 @@
           };
           await 等一下(150);
         }
-        return 命中 || { 成功: false, 原因: '等 get_rw 超时' };
+        if (命中) return 命中;
+        if (暂态错误时刻) {
+          return {
+            成功: false, 暂态无数据: true, 错误码: 账号暂态错误码,
+            原因: `get_rw error=${账号暂态错误码} 等待 10 秒后仍无数据`,
+          };
+        }
+        return { 成功: false, 原因: '等 get_rw 超时' };
       },
       停() {
         if (已停) return;
@@ -1786,6 +1830,7 @@
       if (c.成功) { 记(`软导航抓到数据（${c.数据.length} 字符）`); return c; }
       if (c.验证码) return c;                 // 验证码要原样上抛，交给上层通知
       if (c.风控) return c;                   // 风控终态，绝不能换路线继续尝试
+      if (c.暂态无数据) return c;             // 当前账号无数据，放回给其它账号，不换路线拖延
       末次 = c;
       记(`软导航路线失败：${c.原因}`, '警告');
       if (配置.仅软导航) return c;             // 严格模式：不再降级，避免风控
@@ -1796,6 +1841,7 @@
       if (b.成功) { 记(`后台页抓到数据（${b.数据.length} 字符）`); return b; }
       if (b.验证码) return b;
       if (b.风控) return b;
+      if (b.暂态无数据) return b;
       末次 = b;
       记(`后台页失败：${b.原因}`, '警告');
     }
@@ -1820,7 +1866,7 @@
   function 设运行(值) { 写(键.运行, !!值); 刷新界面(); }
 
   // 校验GetRw响应 已在各抓取路线放行前拦住非零业务码；这里作为提交前的
-  // 最后一层保险。266900002 / 266900504 都不能再被当作可提交数据。
+  // 最后一层保险。业务错误码都不能被当作可提交数据。
   function 可忽略错误码(码) {
     return 码 === null || 码 === 0;
   }
@@ -1863,6 +1909,17 @@
     // 抓数据
     const 抓 = await 抓数据(任务);
     if (!抓.成功) {
+      if (抓.暂态无数据) {
+        // 266900002 只说明本账号暂时拿不到详情，不代表商品不存在。
+        // failTask 会把状态从 2 放回 0，并排除当前账号，让其它账号接手。
+        记(`当前账号 get_rw error=${账号暂态错误码}，等待 10 秒仍无数据，放回给其它账号`, '警告');
+        const 已放回 = await 确认放回当前任务(
+          任务, `shopee_get_rw_${账号暂态错误码}_account_specific: ${抓.原因}`);
+        计一次('失败');
+        return 已放回
+          ? { 结果: '当前账号无商品数据，已放回' }
+          : { 结果: '任务放回失败', 停止: true };
+      }
       if (抓.风控) {
         记(`检测到账号/会话风控，已停止：${抓.原因}`, '错误');
         await 通知风控两次();
@@ -2066,6 +2123,7 @@
     const 原XHR发送 = XMLHttpRequest.prototype.send;
     const 原XHR开启 = XMLHttpRequest.prototype.open;
     let 已交 = false;
+    let 暂态错误时刻 = 0;
 
     const 目标请求 = 取GetRw商品号(待抓.目标);
     const 目标号 = 目标请求 ? 目标请求.号 : '';
@@ -2086,7 +2144,12 @@
     function 收响应(文本, 地址) {
       if (已交 || !文本) return;
       const 校验 = 校验GetRw响应(文本, 地址, 目标号);
-      if (校验.成功) 交差(校验);
+      if (校验.成功) {
+        交差(校验);
+      } else if (校验.暂态无数据 && !暂态错误时刻) {
+        暂态错误时刻 = 现在();
+        画标记('⚠ 当前账号暂无商品数据，最多再等 10 秒');
+      }
     }
 
     if (原fetch) {
@@ -2178,6 +2241,13 @@
         const 新 = 读(键.待抓, null);
         if (新 && 新.单号 === 待抓.单号 && 新.截止) 截止 = 新.截止;
       } catch (_) {}
+      if (暂态错误时刻 && 现在() >= Math.min(截止, 暂态错误时刻 + 账号暂态等待毫秒)) {
+        交差({
+          成功: false, 暂态无数据: true, 错误码: 账号暂态错误码,
+          原因: `get_rw error=${账号暂态错误码} 等待 10 秒后仍无数据`,
+        });
+        return;
+      }
       if (现在() > 截止) {
         交差({ 成功: false, 原因: 上次状态 === '验证码'
           ? '等你做验证码超时' : '子页面等 get_rw 超时' });
@@ -2213,7 +2283,7 @@
   }
 
   // ══════════════════════════════════════════ 界面
-  let 宿主 = null, 影子 = null, 面板 = null, 球 = null;
+  let 宿主 = null, 影子 = null, 面板 = null, 球 = null, 外部开关 = null;
   let 元素 = {};
 
   const 样式 = `
@@ -2221,10 +2291,14 @@
     * { box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont,
         'PingFang SC', 'Microsoft YaHei', sans-serif; }
     .球 { position: fixed; right: 10px; bottom: 92px; width: 52px; height: 52px;
-      border-radius: 50%; background: #ee4d2d; color: #fff; border: 0;
+      border-radius: 50%; background: #475569; color: #fff; border: 0;
       z-index: 2147483646; font-size: 11px; font-weight: 700; line-height: 1.2;
       box-shadow: 0 3px 10px rgba(0,0,0,.3); touch-action: none; }
-    .球.跑 { background: #16a34a; }
+    .外部开关 { position: fixed; right: 70px; bottom: 92px; min-width: 104px; height: 52px;
+      padding: 0 14px; border-radius: 26px; background: #16a34a; color: #fff; border: 0;
+      z-index: 2147483646; font-size: 13px; font-weight: 700; line-height: 1.2;
+      box-shadow: 0 3px 10px rgba(0,0,0,.3); touch-action: none; }
+    .外部开关.跑 { background: #dc2626; }
     .面板 { position: fixed; inset: auto 0 0; height: 50vh; height: 50dvh;
       background: #f6f7f9; z-index: 2147483647; display: none; flex-direction: column;
       border-radius: 16px 16px 0 0; overflow: hidden;
@@ -2286,13 +2360,60 @@
     return e;
   }
 
+  function 打开面板() {
+    if (!面板) return;
+    面板.classList.add('开');
+    刷新界面();
+    刷新服务端完成();
+    检查更新(false);
+  }
+
+  async function 切换任务() {
+    if (是运行中()) {
+      停止请求 = true;
+      设运行(false);
+      记('已手动停止');
+      return { 成功: true, 运行中: false };
+    }
+
+    const c = 取配置();
+    if (!(c.设备名称 || c.接单账号)) {
+      打开面板();
+      if (元素.状态) 元素.状态.textContent = '请先填设备名称';
+      记('启动失败：未配置接单账号/设备名称', '警告');
+      return { 成功: false, 原因: '未配置接单账号/设备名称' };
+    }
+    if (!令牌.取().token) {
+      打开面板();
+      if (元素.状态) 元素.状态.textContent = '请先在①里填 token';
+      记('启动失败：未填写 token', '警告');
+      return { 成功: false, 原因: '未填写 token' };
+    }
+    // 通道不通就跑不了任何接口，先确认再开工，别让主循环空转报错
+    if (!桥.就绪) {
+      if (元素.状态) 元素.状态.textContent = '正在准备跨域通道…';
+      const ok = await 连桥();
+      if (!ok) {
+        打开面板();
+        if (元素.状态) 元素.状态.textContent = '跨域通道不可用，见②的说明';
+        return { 成功: false, 原因: '跨域通道不可用' };
+      }
+    }
+    刷新服务端完成();
+    设运行(true);
+    记('开始跑任务');
+    主循环();
+    return { 成功: true, 运行中: true };
+  }
+
   function 建界面() {
     宿主 = 造('div', { id: '跑任务宿主' });
     影子 = 宿主.attachShadow ? 宿主.attachShadow({ mode: 'closed' }) : 宿主;
     (document.body || document.documentElement).appendChild(宿主);
     造('style', { 文: 样式 }, 影子);
 
-    球 = 造('button', { 类: '球', 文: '跑任务' }, 影子);
+    外部开关 = 造('button', { 类: '外部开关', 文: '启动任务' }, 影子);
+    球 = 造('button', { 类: '球', 文: '设置' }, 影子);
     面板 = 造('div', { 类: '面板' }, 影子);
 
     const 头 = 造('div', { 类: '头' }, 面板);
@@ -2300,12 +2421,8 @@
     const 收 = 造('button', { 文: '收起' }, 头);
     const 体 = 造('div', { 类: '体' }, 面板);
 
-    球.addEventListener('click', () => {
-      面板.classList.add('开');
-      刷新界面();
-      刷新服务端完成();
-      检查更新(false);
-    });
+    外部开关.addEventListener('click', () => 切换任务());
+    球.addEventListener('click', 打开面板);
     收.addEventListener('click', () => 面板.classList.remove('开'));
 
     建令牌卡(体);
@@ -2632,7 +2749,6 @@
       style: 'border:0;border-radius:6px;padding:5px 8px;font-size:11px;color:#fff;background:#64748b',
     }, 标题行);
 
-    元素.开关 = 造('button', { 类: '钮 绿', 文: '开始跑任务' }, 卡);
     元素.状态 = 造('div', { 类: '态', 文: '未运行' }, 卡);
 
     元素.数格 = 造('div', { 类: '数格', style: 'margin-top:10px' }, 卡);
@@ -2643,37 +2759,6 @@
     }
     元素.完成态 = 造('div', { 类: '提', 文: '完成数从服务器读取' }, 卡);
     元素.刷新完成钮.addEventListener('click', () => 刷新服务端完成());
-
-    元素.开关.addEventListener('click', async () => {
-      if (是运行中()) {
-        停止请求 = true;
-        设运行(false);
-        记('已手动停止');
-        return;
-      }
-      const c = 取配置();
-      if (!(c.设备名称 || c.接单账号)) {
-        元素.状态.textContent = '请先填设备名称';
-        return;
-      }
-      if (!令牌.取().token) {
-        元素.状态.textContent = '请先在①里填 token';
-        return;
-      }
-      // 通道不通就跑不了任何接口，先确认再开工，别让主循环空转报错
-      if (!桥.就绪) {
-        元素.状态.textContent = '正在准备跨域通道…';
-        const ok = await 连桥();
-        if (!ok) {
-          元素.状态.textContent = '跨域通道不可用，见②的说明';
-          return;
-        }
-      }
-      刷新服务端完成();
-      设运行(true);
-      记('开始跑任务');
-      主循环();
-    });
 
     const 清 = 造('button', { 类: '钮 灰', 文: '清空本机失败数' }, 卡);
     清.addEventListener('click', () => {
@@ -2732,13 +2817,9 @@
     const 服务端完成 = 服务端完成状态.日期 === 北京日期()
       ? 服务端完成状态.数 : null;
 
-    if (球) {
-      球.classList.toggle('跑', 跑着);
-      球.textContent = 跑着 ? `跑中\n${服务端完成 === null ? '—' : 服务端完成}` : '跑任务';
-    }
-    if (元素.开关) {
-      元素.开关.textContent = 跑着 ? '停止' : '开始跑任务';
-      元素.开关.className = 跑着 ? '钮 红' : '钮 绿';
+    if (外部开关) {
+      外部开关.classList.toggle('跑', 跑着);
+      外部开关.textContent = 跑着 ? '停止任务' : '启动任务';
     }
     if (元素.登录态 && 令牌.取().token) {
       // 只在没有更具体信息时覆盖，别把校验结果冲掉
@@ -2951,6 +3032,7 @@
       算间隔, 时段概览, 当前时段,
       通知,
       比较版本, 取更新状态, 检查更新, 立即更新,
+      切换任务,
       开始() { 设运行(true); 主循环(); return '已开始'; },
       停止() { 停止请求 = true; 设运行(false); return '已停止'; },
       显示() {
@@ -2964,6 +3046,6 @@
       内部: { 加密, 解密, 压缩, 解析北京时刻, 北京分钟, 拼接口地址 },
     };
 
-    console.log(`[虾皮跑任务 ${版本}] 主控页已就绪，点右下角悬浮球打开界面`);
+    console.log(`[虾皮跑任务 ${版本}] 主控页已就绪，点右下角“启动任务”开始，点“设置”打开面板`);
   }
 })();
