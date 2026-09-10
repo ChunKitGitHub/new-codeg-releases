@@ -9,8 +9,8 @@
 // @match        https://*.shopee.tw/*
 // @grant        GM_xmlhttpRequest
 // @connect      raw.githubusercontent.com
-// @downloadURL  https://cdn.jsdelivr.net/gh/ChunKitGitHub/new-codeg-releases@main/sp.user.js
-// @updateURL    https://cdn.jsdelivr.net/gh/ChunKitGitHub/new-codeg-releases@main/sp.user.js
+// @updateURL    https://raw.githubusercontent.com/ChunKitGitHub/new-codeg-releases/main/sp.meta.js
+// @downloadURL  https://raw.githubusercontent.com/ChunKitGitHub/new-codeg-releases/main/sp.user.js
 // ==/UserScript==
 
 // ============================================================================
@@ -55,14 +55,14 @@
   // ────────────────────────────────────────────── 常量
   const 接口基址 = 'https://allplat.top/api';
   const 平台 = 'shopee';
-  // GitHub Raw 用于检查（版本立刻可见）；jsDelivr 用于安装（响应是
-  // application/javascript，Via 才会弹出覆盖安装确认，而不是只下载文本）。
-  // 安装时固定到 v<版本号> Git tag，避免 main 分支 CDN 缓存装到旧版本。
-  // 两者都只承载公开脚本，更新请求绝不携带 allplat token、账号或任务数据。
+  // 更新源直接维护在 GitHub main 分支（不需要 Releases 或 Git tags）：
+  // sp.meta.js 仅含元数据头，供 Userscripts / 脚本自身快速轻量检查版本；
+  // sp.user.js 为完整脚本，供 Userscripts / 浏览器覆盖安装。
+  // 更新请求绝不携带 allplat token、账号或任务数据。
   const 更新检查地址 =
-    'https://raw.githubusercontent.com/ChunKitGitHub/new-codeg-releases/main/sp.user.js';
+    'https://raw.githubusercontent.com/ChunKitGitHub/new-codeg-releases/main/sp.meta.js';
   const 更新安装地址 =
-    'https://cdn.jsdelivr.net/gh/ChunKitGitHub/new-codeg-releases@main/sp.user.js';
+    'https://raw.githubusercontent.com/ChunKitGitHub/new-codeg-releases/main/sp.user.js';
   const 更新检查间隔毫秒 = 12 * 60 * 60 * 1000;
   const 更新请求超时毫秒 = 15000;
 
@@ -162,7 +162,7 @@
 
   function 版本安装地址(目标版本) {
     if (!是规范版本(目标版本)) return 更新安装地址;
-    return `https://cdn.jsdelivr.net/gh/ChunKitGitHub/new-codeg-releases@v${目标版本}/sp.user.js`;
+    return 更新安装地址;
   }
 
   function 取远程脚本版本(文本) {
@@ -174,26 +174,37 @@
   let 更新检查中 = false;
 
   async function 取远程更新脚本() {
-    const 地址 = 带更新参数(更新检查地址, 'check', 现在());
     const 头 = { Accept: 'text/plain, application/javascript;q=0.9, */*;q=0.1' };
-    if (有GM) {
-      const r = await GM请求('GET', 地址, 头, undefined, 更新请求超时毫秒);
-      if (!r.成功 || r.状态 < 200 || r.状态 >= 300) {
-        throw new Error(r.错误 || `GitHub 返回 HTTP ${r.状态 || 0}`);
+    const 请求文本 = async (目标地址) => {
+      const 地址 = 带更新参数(目标地址, 'check', 现在());
+      if (有GM) {
+        const r = await GM请求('GET', 地址, 头, undefined, 更新请求超时毫秒);
+        if (!r.成功 || r.状态 < 200 || r.状态 >= 300) {
+          throw new Error(r.错误 || `GitHub 返回 HTTP ${r.状态 || 0}`);
+        }
+        return r.文本;
       }
-      return r.文本;
-    }
 
-    const 控制 = new AbortController();
-    const 定时器 = setTimeout(() => 控制.abort(), 更新请求超时毫秒);
+      const 控制 = new AbortController();
+      const 定时器 = setTimeout(() => 控制.abort(), 更新请求超时毫秒);
+      try {
+        const r = await fetch(地址, {
+          method: 'GET', cache: 'no-store', credentials: 'omit', headers: 头, signal: 控制.signal,
+        });
+        if (!r.ok) throw new Error(`GitHub 返回 HTTP ${r.status}`);
+        return await r.text();
+      } finally {
+        clearTimeout(定时器);
+      }
+    };
+
     try {
-      const r = await fetch(地址, {
-        method: 'GET', cache: 'no-store', credentials: 'omit', headers: 头, signal: 控制.signal,
-      });
-      if (!r.ok) throw new Error(`GitHub 返回 HTTP ${r.status}`);
-      return await r.text();
-    } finally {
-      clearTimeout(定时器);
+      return await 请求文本(更新检查地址);
+    } catch (e) {
+      if (更新检查地址 !== 更新安装地址) {
+        return await 请求文本(更新安装地址);
+      }
+      throw e;
     }
   }
 
